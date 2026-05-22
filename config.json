@@ -1,0 +1,17 @@
+{
+    capture: {
+        device_name: "default",
+        num_channels: 2,
+        postprocess_sink_path: "/tmp/record.wav",
+    },
+    render: {
+        device_name: "default",
+        num_channels: 2,
+        mute: true,
+    },
+    config: {
+        noise_suppression: {
+            level: "High",
+        },
+    },
+}

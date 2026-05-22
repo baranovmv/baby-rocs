@@ -1,248 +1,288 @@
-// src/main.rs
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SupportedStreamConfigRange};
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex, Arc};
+use anyhow::{anyhow, Error};
+use hound::{WavIntoSamples, WavReader, WavWriter};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, File},
+    io::{BufReader, BufWriter},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
+use structopt::StructOpt;
+use webrtc_audio_processing::Processor;
+use webrtc_audio_processing_config::Config;
 
-const REQUIRED_SAMPLE_RATE: u32 = 48_000;
-const REQUIRED_CHANNELS: u16 = 1;
-const REQUIRED_FORMAT: SampleFormat = SampleFormat::F32;
+mod common;
+use common::{deinterleave, interleave};
 
-type WavWriterHandle = Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>;
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+const AUDIO_INTERLEAVED: bool = true;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-enum Direction {
-    Input,
-    Output,
-}
-
-#[derive(Parser, Debug)]
-#[command(about = "Open a 48 kHz / mono / f32 cpal stream on a named ALSA device")]
+#[derive(Debug, StructOpt)]
 struct Args {
-    /// ALSA device designator as shown by `aplay -L` / `arecord -L`
-    /// (e.g. "default", "plughw:CARD=UA25,DEV=0", "hw:1,0", "pipewire").
-    #[arg(short, long)]
-    device: String,
+    /// Configuration file that stores JSON serialization of [`Option`] struct.
+    #[structopt(short, long)]
+    pub config_file: Option<PathBuf>,
 
-    /// List available devices and exit.
-    #[arg(long)]
-    list: bool,
-
-    /// Stream direction.
-    #[arg(long, value_enum, default_value_t = Direction::Input)]
-    direction: Direction,
-
-    #[arg(long)]
-    wav: PathBuf,
+    /// List available audio devices and exit.
+    #[structopt(long)]
+    pub list_devices: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let host = cpal::default_host();
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+struct CaptureOptions {
+    /// Name of the audio capture device.
+    device_name: String,
+    /// The number of audio capture channels.
+    num_channels: u16,
+    /// If specified, it reads the capture stream from the WAV file instead of the device.
+    source_path: Option<PathBuf>,
+    /// If specified, it writes the capture stream to the WAV file before applying the processing.
+    preprocess_sink_path: Option<PathBuf>,
+    /// If specified, it writes the capture stream to the WAV file after applying the processing.
+    postprocess_sink_path: Option<PathBuf>,
+}
 
-    if args.list {
-        return list_devices(&host);
-    }
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+struct RenderOptions {
+    /// Name of the audio playback device.
+    device_name: String,
+    /// The number of audio playback channels.
+    num_channels: u16,
+    /// If specified, it plays back the audio stream from the WAV file. Otherwise, a stream of
+    /// zeros are sent to the audio device.
+    source_path: Option<PathBuf>,
+    /// If true, the output is muted.
+    #[serde(default)]
+    mute: bool,
+}
 
-    let device = find_device(&host, &args.device, args.direction)
-        .with_context(|| format!("resolving device `{}`", args.device))?;
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+struct Options {
+    /// Options for audio capture / recording.
+    capture: CaptureOptions,
+    /// Options for audio render / playback.
+    render: RenderOptions,
+    /// Configurations of the audio processing pipeline.
+    config: Config,
+}
 
-    let dev_name = device.name().unwrap_or_else(|_| "<unnamed>".into());
-    println!("Using device: {dev_name}");
-
-    // Check the device actually supports 48 kHz / mono / f32.
-    let config = pick_required_config(&device, args.direction)
-        .with_context(|| format!("device `{dev_name}` cannot provide 48 kHz mono f32"))?;
-
-    println!("Stream config: {config:?}");
-
-    let (tx, rx) = mpsc::channel::<Result<()>>();
-
-    let Ok(wav_writer) = wav_writer(&args.wav) else {
-        eprintln!("Can't open wav file");
-        return Ok(());
-    };
-    let wav_writer = Arc::new(Mutex::new(Some(wav_writer)));
-    let stream = build_stream(&device, &config, args.direction, wav_writer, tx.clone())?;
-    stream.play().context("starting stream")?;
-
-    ctrlc::set_handler({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Ok(()));
+fn match_device(
+    pa: &portaudio::PortAudio,
+    device_name: Regex,
+) -> Result<portaudio::DeviceIndex, Error> {
+    for device in (pa.devices()?).flatten() {
+        if device_name.is_match(device.1.name) {
+            return Ok(device.0);
         }
-    })
-    .ok();
-
-    match rx.recv() {
-        Ok(Ok(())) => println!("Shutting down."),
-        Ok(Err(e)) => eprintln!("Stream error: {e:?}"),
-        Err(_) => {}
     }
-
-    drop(stream);
-    Ok(())
+    Err(anyhow!("Audio device matching \"{}\" not found.", device_name))
 }
 
-fn wav_writer(path: &Path) -> Result<hound::WavWriter<BufWriter<File>>> {
-    let config = hound::WavSpec {
-        channels: REQUIRED_CHANNELS,
-        sample_rate: REQUIRED_SAMPLE_RATE,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let writer = hound::WavWriter::create(path, config)?;
-    return Ok(writer);
+fn create_stream_settings(
+    pa: &portaudio::PortAudio,
+    processor: &Processor,
+    opt: &Options,
+) -> Result<portaudio::DuplexStreamSettings<f32, f32>, Error> {
+    let input_device = match_device(pa, Regex::new(&opt.capture.device_name)?)?;
+    let input_device_info = &pa.device_info(input_device)?;
+    let input_params = portaudio::StreamParameters::<f32>::new(
+        input_device,
+        opt.capture.num_channels as i32,
+        AUDIO_INTERLEAVED,
+        input_device_info.default_low_input_latency,
+    );
+
+    let output_device = match_device(pa, Regex::new(&opt.render.device_name)?)?;
+    let output_device_info = &pa.device_info(output_device)?;
+    let output_params = portaudio::StreamParameters::<f32>::new(
+        output_device,
+        opt.render.num_channels as i32,
+        AUDIO_INTERLEAVED,
+        output_device_info.default_low_output_latency,
+    );
+
+    pa.is_duplex_format_supported(input_params, output_params, f64::from(AUDIO_SAMPLE_RATE))?;
+
+    Ok(portaudio::DuplexStreamSettings::new(
+        input_params,
+        output_params,
+        f64::from(AUDIO_SAMPLE_RATE),
+        processor.num_samples_per_frame() as u32,
+    ))
 }
 
-fn find_device<H: HostTrait>(host: &H, designator: &str, direction: Direction) -> Result<H::Device>
-where
-    H::Device: DeviceTrait,
-{
-    if designator == "default" {
-        return match direction {
-            Direction::Input => host
-                .default_input_device()
-                .ok_or_else(|| anyhow!("no default input device")),
-            Direction::Output => host
-                .default_output_device()
-                .ok_or_else(|| anyhow!("no default output device")),
-        };
-    }
+fn open_wav_writer(path: &Path, channels: u16) -> Result<WavWriter<BufWriter<File>>, Error> {
+    let sink = hound::WavWriter::<BufWriter<File>>::create(
+        path,
+        hound::WavSpec {
+            channels,
+            sample_rate: AUDIO_SAMPLE_RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )?;
 
-    let mut candidates: Box<dyn Iterator<Item = H::Device>> = match direction {
-        Direction::Input => Box::new(host.input_devices()?),
-        Direction::Output => Box::new(host.output_devices()?),
-    };
-
-    candidates
-        .find(|d| {
-            let id_match = d.id().map(|i| i.to_string() == designator).unwrap_or(false);
-            let name_match = d.name().map(|n| n == designator).unwrap_or(false);
-            id_match || name_match
-        })
-        .ok_or_else(|| anyhow!("no {:?} device matches `{}`", direction, designator))
+    Ok(sink)
 }
 
-/// Verify the device supports exactly 48 kHz / mono / f32 and return a concrete
-/// StreamConfig for it. Emits a descriptive error otherwise.
-fn pick_required_config<D: DeviceTrait>(
-    device: &D,
-    direction: Direction,
-) -> Result<cpal::StreamConfig> {
-    let supported: Vec<SupportedStreamConfigRange> = match direction {
-        Direction::Input => device.supported_input_configs()?.collect(),
-        Direction::Output => device.supported_output_configs()?.collect(),
-    };
+fn open_wav_reader(path: &Path) -> Result<WavIntoSamples<BufReader<File>, f32>, Error> {
+    let reader = WavReader::<BufReader<File>>::open(path)?;
+    Ok(reader.into_samples())
+}
 
-    let sr = REQUIRED_SAMPLE_RATE;
-
-    let matched = supported.iter().find(|r| {
-        r.channels() == REQUIRED_CHANNELS
-            && r.sample_format() == REQUIRED_FORMAT
-            && r.min_sample_rate() <= sr
-            && r.max_sample_rate() >= sr
-    });
-
-    match matched {
-        Some(range) => {
-            let cfg = range.clone().with_sample_rate(sr).config();
-            Ok(cfg)
+// The destination array is an interleaved audio stream.
+// Returns false if there are no more entries to read from the source.
+fn copy_stream(source: &mut WavIntoSamples<BufReader<File>, f32>, dest: &mut [f32]) -> bool {
+    let mut dest_iter = dest.iter_mut();
+    for sample in source.flatten() {
+        *dest_iter.next().unwrap() = sample;
+        if dest_iter.len() == 0 {
+            break;
         }
-        None => {
-            // Build a readable summary of what the device *does* support to help
-            // the user diagnose the mismatch.
-            let summary: Vec<String> = supported
-                .iter()
-                .map(|r| {
-                    format!(
-                        "channels={}, format={:?}, sample_rate={}..={}",
-                        r.channels(),
-                        r.sample_format(),
-                        r.min_sample_rate(),
-                        r.max_sample_rate(),
-                    )
-                })
-                .collect();
+    }
 
-            bail!(
-                "device does not support the required format \
-                 (channels={REQUIRED_CHANNELS}, sample_rate={REQUIRED_SAMPLE_RATE}, \
-                 format={REQUIRED_FORMAT:?}).\nSupported configs:\n  {}",
-                summary.join("\n  ")
+    let source_eof = dest_iter.len() > 0;
+
+    // Zero-fill the remainder of the destination array if we finish consuming
+    // the source.
+    for sample in dest_iter {
+        *sample = 0.0;
+    }
+
+    !source_eof
+}
+
+fn main() -> Result<(), Error> {
+    let args = Args::from_args();
+
+    let pa = portaudio::PortAudio::new()?;
+
+    if args.list_devices {
+        for device in (pa.devices()?).flatten() {
+            let (idx, info) = device;
+            println!(
+                "{:?}: {:?} (in: {}, out: {})",
+                idx, info.name, info.max_input_channels, info.max_output_channels
             );
         }
+        println!("\nDefault input: {:?}", pa.default_input_device());
+        println!("Default output: {:?}", pa.default_output_device());
+        return Ok(());
     }
-}
 
-fn build_stream<D: DeviceTrait>(
-    device: &D,
-    cfg: &cpal::StreamConfig,
-    direction: Direction,
-    wav_writer: WavWriterHandle,
-    err_tx: mpsc::Sender<Result<()>>,
-) -> Result<D::Stream> {
-    let err_fn = move |e: cpal::StreamError| {
-        let _ = err_tx.send(Err(anyhow!(e)));
+    let config_file = args.config_file.ok_or_else(|| anyhow!("--config-file is required"))?;
+    let opt: Options = json5::from_str(&fs::read_to_string(&config_file)?)?;
+
+    let processor = Arc::new(Processor::new(AUDIO_SAMPLE_RATE)?);
+
+    processor.set_config(opt.config);
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut capture_source =
+        if let Some(path) = &opt.capture.source_path { Some(open_wav_reader(path)?) } else { None };
+    let mut capture_preprocess_sink = if let Some(path) = &opt.capture.preprocess_sink_path {
+        Some(open_wav_writer(path, opt.capture.num_channels)?)
+    } else {
+        None
     };
+    let mut capture_postprocess_sink = if let Some(path) = &opt.capture.postprocess_sink_path {
+        Some(open_wav_writer(path, opt.capture.num_channels)?)
+    } else {
+        None
+    };
+    let mut render_source =
+        if let Some(path) = &opt.render.source_path { Some(open_wav_reader(path)?) } else { None };
 
-    let stream = match direction {
-        Direction::Output => device.build_output_stream(
-            cfg,
-            |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                for s in data.iter_mut() {
-                    *s = 0.0;
+    let audio_callback = {
+        // Allocate buffers outside the performance-sensitive audio loop.
+        let mut input_mut =
+            vec![0f32; processor.num_samples_per_frame() * opt.capture.num_channels as usize];
+        let mut input_deinterleaved =
+            vec![vec![0f32; processor.num_samples_per_frame()]; opt.capture.num_channels as usize];
+
+        let mut output_deinterleaved =
+            vec![vec![0f32; processor.num_samples_per_frame()]; opt.render.num_channels as usize];
+
+        let running = running.clone();
+        let mute = opt.render.mute;
+        let processor = Arc::clone(&processor);
+        move |portaudio::DuplexStreamCallbackArgs { in_buffer, out_buffer, frames, .. }| {
+            assert_eq!(frames, processor.num_samples_per_frame());
+
+            let mut should_continue = true;
+
+            if let Some(source) = &mut capture_source {
+                if !copy_stream(source, &mut input_mut) {
+                    should_continue = false;
                 }
-            },
-            err_fn,
-            None,
-        )?,
-        Direction::Input => device.build_input_stream(
-            cfg,
-            move |_data: &[f32], _: &cpal::InputCallbackInfo| {
-                process_input (_data, &wav_writer);
-            },
-            err_fn,
-            None,
-        )?,
-    };
+            } else {
+                input_mut.copy_from_slice(in_buffer);
+            }
 
-    Ok(stream)
-}
+            if let Some(sink) = &mut capture_preprocess_sink {
+                for sample in &input_mut {
+                    sink.write_sample(*sample).unwrap();
+                }
+            }
 
-fn list_devices<H: HostTrait>(host: &H) -> Result<()>
-where
-    H::Device: DeviceTrait,
-{
-    println!("Input devices:");
-    for d in host.input_devices()? {
-        println!(
-            "  name={:?} id={:?}",
-            d.name().ok(),
-            d.id().ok().map(|i| i.to_string())
-        );
-    }
-    println!("Output devices:");
-    for d in host.output_devices()? {
-        println!(
-            "  name={:?} id={:?}",
-            d.name().ok(),
-            d.id().ok().map(|i| i.to_string())
-        );
-    }
-    Ok(())
-}
+            deinterleave(&input_mut, &mut input_deinterleaved);
+            processor.process_capture_frame(&mut input_deinterleaved).unwrap();
+            interleave(&input_deinterleaved, &mut input_mut);
 
-fn process_input(x: &[f32], wav_writer: &WavWriterHandle) {
-    if let Ok(mut guard) = wav_writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for sample in x.iter() {
-                writer.write_sample(*sample);
+            if let Some(sink) = &mut capture_postprocess_sink {
+                for sample in &input_mut {
+                    sink.write_sample(*sample).unwrap();
+                }
+            }
+
+            if let Some(source) = &mut render_source {
+                if !copy_stream(source, out_buffer) {
+                    should_continue = false;
+                }
+            } else {
+                out_buffer.iter_mut().for_each(|m| *m = 0.0)
+            }
+
+            deinterleave(out_buffer, &mut output_deinterleaved);
+            processor.process_render_frame(&mut output_deinterleaved).unwrap();
+            interleave(&output_deinterleaved, out_buffer);
+
+            if mute {
+                out_buffer.iter_mut().for_each(|m| *m = 0.0)
+            }
+
+            if should_continue {
+                portaudio::Continue
+            } else {
+                running.store(false, Ordering::SeqCst);
+                portaudio::Complete
             }
         }
+    };
+
+    let stream_settings = create_stream_settings(&pa, &processor, &opt)?;
+    let mut stream = pa.open_non_blocking_stream(stream_settings, audio_callback)?;
+    stream.start()?;
+
+    ctrlc::set_handler({
+        let running = running.clone();
+        move || {
+            running.store(false, Ordering::SeqCst);
+        }
+    })?;
+
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(10));
     }
+
+    println!("{:#?}", processor.get_stats());
+
+    Ok(())
 }

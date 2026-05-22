@@ -1,0 +1,3 @@
+[submodule "3rdparty/webrtc-audio-processing"]
+	path = 3rdparty/webrtc-audio-processing
+	url = git@ssh.gitlab.freedesktop.org:pulseaudio/webrtc-audio-processing.git

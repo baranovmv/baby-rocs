@@ -9,6 +9,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
+        mpsc::{*}
     },
     thread,
     time::Duration,
@@ -16,12 +17,15 @@ use std::{
 use structopt::StructOpt;
 use webrtc_audio_processing::Processor;
 use webrtc_audio_processing_config::Config;
+use crossbeam_queue::ArrayQueue;
 
 mod common;
 use common::{deinterleave, interleave};
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_INTERLEAVED: bool = true;
+
+type SampleBuffer = Arc<Vec<f32>>;
 
 #[derive(Debug, StructOpt)]
 struct Args {
@@ -187,11 +191,6 @@ fn main() -> Result<(), Error> {
 
     let mut capture_source =
         if let Some(path) = &opt.capture.source_path { Some(open_wav_reader(path)?) } else { None };
-    let mut capture_preprocess_sink = if let Some(path) = &opt.capture.preprocess_sink_path {
-        Some(open_wav_writer(path, opt.capture.num_channels)?)
-    } else {
-        None
-    };
     let mut capture_postprocess_sink = if let Some(path) = &opt.capture.postprocess_sink_path {
         Some(open_wav_writer(path, opt.capture.num_channels)?)
     } else {
@@ -200,10 +199,24 @@ fn main() -> Result<(), Error> {
     let mut render_source =
         if let Some(path) = &opt.render.source_path { Some(open_wav_reader(path)?) } else { None };
 
+    let buffer_pool = Arc::new(ArrayQueue::<Arc<Vec::<f32>>>::new(64));
+    for _ in 0..64 {
+        buffer_pool.push(Arc::new(
+            vec![0f32; processor.num_samples_per_frame() * opt.capture.num_channels as usize]
+        )
+        );
+    }
+    let (worker_in_tx, worker_in_rx) = channel();
+    let (worker_out_tx, worker_out_rx) = channel();
+    let buffer_pool_wrkr = buffer_pool.clone();
+
+    let preprocess_sink_path = opt.capture.preprocess_sink_path.clone();
+    let worker_thr = thread::spawn(move || {
+        worker_thread(worker_in_rx, worker_out_tx, &preprocess_sink_path, buffer_pool_wrkr);
+    });
+
     let audio_callback = {
         // Allocate buffers outside the performance-sensitive audio loop.
-        let mut input_mut =
-            vec![0f32; processor.num_samples_per_frame() * opt.capture.num_channels as usize];
         let mut input_deinterleaved =
             vec![vec![0f32; processor.num_samples_per_frame()]; opt.capture.num_channels as usize];
 
@@ -217,42 +230,43 @@ fn main() -> Result<(), Error> {
             assert_eq!(frames, processor.num_samples_per_frame());
 
             let mut should_continue = true;
-
+            let mut in_buffer_arc = buffer_pool.pop().unwrap();
+            let in_buf = Arc::get_mut(&mut in_buffer_arc).unwrap();
             if let Some(source) = &mut capture_source {
-                if !copy_stream(source, &mut input_mut) {
+                if !copy_stream(source, in_buf) {
                     should_continue = false;
                 }
             } else {
-                input_mut.copy_from_slice(in_buffer);
+                in_buf.copy_from_slice(in_buffer);
             }
 
-            if let Some(sink) = &mut capture_preprocess_sink {
-                for sample in &input_mut {
-                    sink.write_sample(*sample).unwrap();
-                }
-            }
-
-            deinterleave(&input_mut, &mut input_deinterleaved);
+            deinterleave(in_buf, &mut input_deinterleaved);
             processor.process_capture_frame(&mut input_deinterleaved).unwrap();
-            interleave(&input_deinterleaved, &mut input_mut);
+            interleave(&input_deinterleaved, in_buf);
+            
+            worker_in_tx.send(in_buffer_arc).unwrap();
 
-            if let Some(sink) = &mut capture_postprocess_sink {
-                for sample in &input_mut {
-                    sink.write_sample(*sample).unwrap();
+            let mut out_buffer_arc = match worker_out_rx.try_recv() {
+                Ok(buf) => buf,
+                _ => {
+                    let mut buf = buffer_pool.pop().unwrap();
+                    Arc::get_mut(&mut buf).unwrap().iter_mut().for_each(|s| *s = 0.0);
+                    buf
                 }
-            }
+            };
 
             if let Some(source) = &mut render_source {
-                if !copy_stream(source, out_buffer) {
+                let out_buf = Arc::get_mut(&mut out_buffer_arc).unwrap();
+                if !copy_stream(source, out_buf) {
                     should_continue = false;
                 }
-            } else {
-                out_buffer.iter_mut().for_each(|m| *m = 0.0)
             }
 
-            deinterleave(out_buffer, &mut output_deinterleaved);
+            deinterleave(Arc::get_mut(&mut out_buffer_arc).unwrap(), &mut output_deinterleaved);
             processor.process_render_frame(&mut output_deinterleaved).unwrap();
             interleave(&output_deinterleaved, out_buffer);
+
+            let _ = buffer_pool.push(out_buffer_arc);
 
             if mute {
                 out_buffer.iter_mut().for_each(|m| *m = 0.0)
@@ -286,3 +300,33 @@ fn main() -> Result<(), Error> {
 
     Ok(())
 }
+
+fn worker_thread(in_buffers: Receiver<SampleBuffer>, out_buffers: Sender<SampleBuffer>,
+    out_path: &Option<PathBuf>, buffer_pool: Arc<ArrayQueue<Arc<Vec<f32>>>>) {
+    
+    let mut capture_preprocess_sink = if let Some(path) = out_path {
+        Some(open_wav_writer(path, 2).unwrap())
+    } else {
+        None
+    };
+
+    loop {
+        match in_buffers.recv() {
+            Ok(buf_in) => {
+                if let Some(sink) = &mut capture_preprocess_sink {
+                    for sample in buf_in.iter() {
+                        sink.write_sample(*sample).unwrap();
+                    }
+                }
+                let _ = buffer_pool.push(buf_in);
+                let buffer_out_arc = buffer_pool.pop().unwrap();
+                for sample in Arc::get_mut(&mut buffer_out_arc.clone()).unwrap().iter_mut() {
+                    *sample = 0.0;
+                }
+                out_buffers.send(buffer_out_arc).unwrap();
+            }
+            Err(_) => return,
+        }
+    }
+}
+

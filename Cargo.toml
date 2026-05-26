@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-roc = { git = "https://codeberg.org/Noffie/roc-rs.git", branch = "dev/noffie", features = ["ffi"] }
+roc = { git = "https://codeberg.org/Misha-Baranov/roc-rs.git", branch = "dev/misha", features = ["ffi"] }
 webrtc-audio-processing = "~2.0"
 webrtc-audio-processing-config = { version = "~2.0", features = ["serde"] }
 anyhow = "1"

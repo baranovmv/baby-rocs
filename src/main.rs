@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Error};
 use hound::{WavIntoSamples, WavReader, WavWriter};
+use nnnoiseless::DenoiseState;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -191,11 +192,6 @@ fn main() -> Result<(), Error> {
 
     let mut capture_source =
         if let Some(path) = &opt.capture.source_path { Some(open_wav_reader(path)?) } else { None };
-    let mut capture_postprocess_sink = if let Some(path) = &opt.capture.postprocess_sink_path {
-        Some(open_wav_writer(path, opt.capture.num_channels)?)
-    } else {
-        None
-    };
     let mut render_source =
         if let Some(path) = &opt.render.source_path { Some(open_wav_reader(path)?) } else { None };
 
@@ -207,12 +203,13 @@ fn main() -> Result<(), Error> {
         );
     }
     let (worker_in_tx, worker_in_rx) = channel();
-    let (worker_out_tx, worker_out_rx) = channel();
     let buffer_pool_wrkr = buffer_pool.clone();
 
-    let preprocess_sink_path = opt.capture.preprocess_sink_path.clone();
+    let postprocess_sink_path = opt.capture.postprocess_sink_path.clone();
+    let num_channels = opt.capture.num_channels;
+    let frame_size = processor.num_samples_per_frame();
     let worker_thr = thread::spawn(move || {
-        worker_thread(worker_in_rx, worker_out_tx, &preprocess_sink_path, buffer_pool_wrkr);
+        worker_thread(worker_in_rx, &postprocess_sink_path, buffer_pool_wrkr, num_channels, frame_size);
     });
 
     let audio_callback = {
@@ -246,13 +243,10 @@ fn main() -> Result<(), Error> {
             
             worker_in_tx.send(in_buffer_arc).unwrap();
 
-            let mut out_buffer_arc = match worker_out_rx.try_recv() {
-                Ok(buf) => buf,
-                _ => {
-                    let mut buf = buffer_pool.pop().unwrap();
-                    Arc::get_mut(&mut buf).unwrap().iter_mut().for_each(|s| *s = 0.0);
-                    buf
-                }
+            let mut out_buffer_arc = {
+                let mut buf = buffer_pool.pop().unwrap();
+                Arc::get_mut(&mut buf).unwrap().iter_mut().for_each(|s| *s = 0.0);
+                buf
             };
 
             if let Some(source) = &mut render_source {
@@ -301,11 +295,25 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn worker_thread(in_buffers: Receiver<SampleBuffer>, out_buffers: Sender<SampleBuffer>,
-    out_path: &Option<PathBuf>, buffer_pool: Arc<ArrayQueue<Arc<Vec<f32>>>>) {
-    
+fn worker_thread(
+    in_buffers: Receiver<SampleBuffer>,
+    out_path: &Option<PathBuf>,
+    buffer_pool: Arc<ArrayQueue<Arc<Vec<f32>>>>,
+    num_channels: u16,
+    frame_size: usize,
+) {
+    let num_ch = num_channels as usize;
+
+    // One DenoiseState per channel (rnnoise operates on mono 480-sample frames at 48kHz)
+    let mut denoise_states: Vec<Box<DenoiseState>> =
+        (0..num_ch).map(|_| DenoiseState::new()).collect();
+
+    // Preallocate per-channel buffers for deinterleave/interleave
+    let mut channel_bufs: Vec<Vec<f32>> = (0..num_ch).map(|_| vec![0.0f32; frame_size]).collect();
+    let mut denoised_buf = vec![0.0f32; frame_size];
+
     let mut capture_preprocess_sink = if let Some(path) = out_path {
-        Some(open_wav_writer(path, 2).unwrap())
+        Some(open_wav_writer(path, num_channels).unwrap())
     } else {
         None
     };
@@ -313,17 +321,34 @@ fn worker_thread(in_buffers: Receiver<SampleBuffer>, out_buffers: Sender<SampleB
     loop {
         match in_buffers.recv() {
             Ok(buf_in) => {
+                // Deinterleave into per-channel buffers
+                for (i, sample) in buf_in.iter().enumerate() {
+                    channel_bufs[i % num_ch][i / num_ch] = *sample;
+                }
+
+                // Denoise each channel in-place
+                // rnnoise expects samples in i16 range (-32768..32767)
+                for (ch, state) in denoise_states.iter_mut().enumerate() {
+                    for s in channel_bufs[ch][..frame_size].iter_mut() {
+                        *s *= 32767.0;
+                    }
+                    state.process_frame(&mut denoised_buf[..frame_size], &channel_bufs[ch][..frame_size]);
+                    for s in denoised_buf[..frame_size].iter_mut() {
+                        *s /= 32767.0;
+                    }
+                    channel_bufs[ch][..frame_size].copy_from_slice(&denoised_buf[..frame_size]);
+                }
+
+                // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {
-                    for sample in buf_in.iter() {
-                        sink.write_sample(*sample).unwrap();
+                    for i in 0..frame_size {
+                        for ch in 0..num_ch {
+                            sink.write_sample(channel_bufs[ch][i]).unwrap();
+                        }
                     }
                 }
+
                 let _ = buffer_pool.push(buf_in);
-                let buffer_out_arc = buffer_pool.pop().unwrap();
-                for sample in Arc::get_mut(&mut buffer_out_arc.clone()).unwrap().iter_mut() {
-                    *sample = 0.0;
-                }
-                out_buffers.send(buffer_out_arc).unwrap();
             }
             Err(_) => return,
         }

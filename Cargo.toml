@@ -16,3 +16,4 @@ serde = {version = "1", features = ["derive"]}
 structopt = "0.3"
 json5 = "0.4"
 crossbeam-queue = "0.3"
+nnnoiseless = "0.5"

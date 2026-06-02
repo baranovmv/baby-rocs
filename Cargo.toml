@@ -4,16 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-roc = { git = "https://codeberg.org/Misha-Baranov/roc-rs.git", branch = "dev/misha", features = ["ffi"] }
-webrtc-audio-processing = "~2.0"
-webrtc-audio-processing-config = { version = "~2.0", features = ["serde"] }
+roc = { git = "https://codeberg.org/Misha-Baranov/roc-rs.git", branch = "dev/misha", features = ["ffi"]}
+df = { path = "3rdparty/DeepFilterNer/libDF", package = "deep_filter", default-features = false }
+ndarray = { version = "^0.15", features = ["serde"] }
+webrtc-audio-processing = { version = "~2.0"}
+webrtc-audio-processing-config = { version = "~2.0", features = ["serde"]}
 anyhow = "1"
-ctrlc = "3"
-portaudio = "0.8"
-regex = "1"
+ctrlc = { version = "3"}
+portaudio = { version = "0.8"}
+regex = { version = "1"}
 hound = "3"
-serde = {version = "1", features = ["derive"]}
-structopt = "0.3"
-json5 = "0.4"
-crossbeam-queue = "0.3"
+serde = { version = "1", features = ["derive"]}
+structopt = { version = "0.3"}
+json5 = { version = "0.4"}
+crossbeam-queue = { version = "0.3"}
 nnnoiseless = "0.5"
+
+[[bin]]
+name = "baby_rocs"
+path = "src/main.rs"

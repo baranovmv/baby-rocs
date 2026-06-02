@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Error};
 use hound::{WavIntoSamples, WavReader, WavWriter};
-use nnnoiseless::DenoiseState;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,17 +15,17 @@ use std::{
     time::Duration,
 };
 use structopt::StructOpt;
+use crossbeam_queue::ArrayQueue;
 use webrtc_audio_processing::Processor;
 use webrtc_audio_processing_config::Config;
-use crossbeam_queue::ArrayQueue;
 
 mod common;
 use common::{deinterleave, interleave};
+mod audio_processing;
+use audio_processing::{Processor as ap, SampleBuffer};
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_INTERLEAVED: bool = true;
-
-type SampleBuffer = Arc<Vec<f32>>;
 
 #[derive(Debug, StructOpt)]
 struct Args {
@@ -303,10 +302,11 @@ fn worker_thread(
     frame_size: usize,
 ) {
     let num_ch = num_channels as usize;
+    let proc = ap::new(num_ch, frame_size);
 
     // One DenoiseState per channel (rnnoise operates on mono 480-sample frames at 48kHz)
-    let mut denoise_states: Vec<Box<DenoiseState>> =
-        (0..num_ch).map(|_| DenoiseState::new()).collect();
+    // let mut denoise_states: Vec<Box<DenoiseState>> =
+    //     (0..num_ch).map(|_| DenoiseState::new()).collect();
 
     // Preallocate per-channel buffers for deinterleave/interleave
     let mut channel_bufs: Vec<Vec<f32>> = (0..num_ch).map(|_| vec![0.0f32; frame_size]).collect();
@@ -321,34 +321,37 @@ fn worker_thread(
     loop {
         match in_buffers.recv() {
             Ok(buf_in) => {
+                let mut in_buffer_arc = buffer_pool.pop().unwrap();
+                proc.process_frame(buf_in.clone(), &mut in_buffer_arc);
                 // Deinterleave into per-channel buffers
-                for (i, sample) in buf_in.iter().enumerate() {
-                    channel_bufs[i % num_ch][i / num_ch] = *sample;
-                }
+                //for (i, sample) in buf_in.iter().enumerate() {
+                    //channel_bufs[i % num_ch][i / num_ch] = *sample;
+                //}
 
                 // Denoise each channel in-place
                 // rnnoise expects samples in i16 range (-32768..32767)
-                for (ch, state) in denoise_states.iter_mut().enumerate() {
-                    for s in channel_bufs[ch][..frame_size].iter_mut() {
-                        *s *= 32767.0;
-                    }
-                    state.process_frame(&mut denoised_buf[..frame_size], &channel_bufs[ch][..frame_size]);
-                    for s in denoised_buf[..frame_size].iter_mut() {
-                        *s /= 32767.0;
-                    }
-                    channel_bufs[ch][..frame_size].copy_from_slice(&denoised_buf[..frame_size]);
-                }
+                //for (ch, state) in denoise_states.iter_mut().enumerate() {
+                    //for s in channel_bufs[ch][..frame_size].iter_mut() {
+                        //*s *= 32767.0;
+                    //}
+                    //state.process_frame(&mut denoised_buf[..frame_size], &channel_bufs[ch][..frame_size]);
+                    //for s in denoised_buf[..frame_size].iter_mut() {
+                        //*s /= 32767.0;
+                    //}
+                    //channel_bufs[ch][..frame_size].copy_from_slice(&denoised_buf[..frame_size]);
+                //}
 
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {
                     for i in 0..frame_size {
                         for ch in 0..num_ch {
-                            sink.write_sample(channel_bufs[ch][i]).unwrap();
+                            sink.write_sample(in_buffer_arc[i]).unwrap();
                         }
                     }
                 }
 
                 let _ = buffer_pool.push(buf_in);
+                let _ = buffer_pool.push(in_buffer_arc);
             }
             Err(_) => return,
         }

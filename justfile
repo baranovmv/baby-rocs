@@ -5,7 +5,7 @@ cross_cxx := cross_toolchain / "bin/arm-none-linux-gnueabihf-g++"
 cross_target := "armv7-unknown-linux-gnueabihf"
 roc_prefix_armhf := "/home/misha/coding/roc-toolkit/install_v0.4.0_zero2w"
 roc_prefix_x86 := "/home/misha/coding/roc-toolkit/install_v0.4.0"
-cargo_home := "{{ justfile_directory() }}/.cargo"
+cargo_home := f"{{ justfile_directory() }}/.cargo"
 
 # Build for current host
 build *args:
@@ -36,7 +36,7 @@ build-armhf *args:
     #meson setup build_docker 3rdparty/webrtc-audio-processing --prefix=/build/build_docker/install && \
     #meson compile -C build_docker && \
     #meson install -C build_docker && \
-    #PKG_CONFIG_PATH=/build/build_docker/install/lib/pkgconfig:/roc/lib/pkgconfig \
+    #PKG_CONFIG_PATH=/build/build_docker/install/lib/pkgconfig:/roc/lib/pkgconfig:/build/build_docker/install/lib/arm-linux-gnueabihf/pkgconfig/ \
     #CXXFLAGS='-I/build/build_docker/install/include' \
     #BINDGEN_EXTRA_CLANG_ARGS='-I/build/build_docker/install/include' \
     #cargo build"CARGO_HOME="{{ cargo_home }}" \

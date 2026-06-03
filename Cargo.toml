@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 roc = { git = "https://codeberg.org/Misha-Baranov/roc-rs.git", branch = "dev/misha", features = ["ffi"]}
-df = { path = "3rdparty/DeepFilterNer/libDF", package = "deep_filter", default-features = false }
+df = { path = "3rdparty/DeepFilterNer/libDF", package = "deep_filter", default-features = false, features = ["tract"] }
 ndarray = { version = "^0.15", features = ["serde"] }
 webrtc-audio-processing = { version = "~2.0"}
 webrtc-audio-processing-config = { version = "~2.0", features = ["serde"]}
@@ -18,7 +18,10 @@ serde = { version = "1", features = ["derive"]}
 structopt = { version = "0.3"}
 json5 = { version = "0.4"}
 crossbeam-queue = { version = "0.3"}
-nnnoiseless = "0.5"
+tract-core = { version = "^0.19.4"}
+tract-onnx = { version = "^0.19.4"}
+tract-pulse = { version = "^0.19.4"}
+tract-hir = { version = "^0.19.4"}
 
 [[bin]]
 name = "baby_rocs"

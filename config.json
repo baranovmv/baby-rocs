@@ -1,12 +1,13 @@
 {
     capture: {
         device_name: "default",
-        num_channels: 2,
-        postprocess_sink_path: "/tmp/record.wav",
+        num_channels: 1,
+        postprocess_sink_path: "/tmp/record_out.wav",
+        preprocess_sink_path: "/tmp/record_in.wav",
     },
     render: {
         device_name: "default",
-        num_channels: 2,
+        num_channels: 1,
         mute: true,
     },
     config: {

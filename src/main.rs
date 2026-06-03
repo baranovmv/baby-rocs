@@ -9,6 +9,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
+        Barrier,
         mpsc::{*}
     },
     thread,
@@ -204,11 +205,14 @@ fn main() -> Result<(), Error> {
     let (worker_in_tx, worker_in_rx) = channel();
     let buffer_pool_wrkr = buffer_pool.clone();
 
+    let preprocess_sink_path = opt.capture.preprocess_sink_path.clone();
     let postprocess_sink_path = opt.capture.postprocess_sink_path.clone();
     let num_channels = opt.capture.num_channels;
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_worker = barrier.clone();
     let frame_size = processor.num_samples_per_frame();
     let worker_thr = thread::spawn(move || {
-        worker_thread(worker_in_rx, &postprocess_sink_path, buffer_pool_wrkr, num_channels, frame_size);
+        worker_thread(worker_in_rx, &preprocess_sink_path, &postprocess_sink_path, buffer_pool_wrkr, num_channels, frame_size, barrier_worker);
     });
 
     let audio_callback = {
@@ -219,6 +223,10 @@ fn main() -> Result<(), Error> {
         let mut output_deinterleaved =
             vec![vec![0f32; processor.num_samples_per_frame()]; opt.render.num_channels as usize];
 
+        // Dedicated render buffer — not taken from the shared pool since it never leaves the callback.
+        let mut render_buffer =
+            vec![0f32; processor.num_samples_per_frame() * opt.render.num_channels as usize];
+
         let running = running.clone();
         let mute = opt.render.mute;
         let processor = Arc::clone(&processor);
@@ -226,7 +234,11 @@ fn main() -> Result<(), Error> {
             assert_eq!(frames, processor.num_samples_per_frame());
 
             let mut should_continue = true;
-            let mut in_buffer_arc = buffer_pool.pop().unwrap();
+            let Some(mut in_buffer_arc) = buffer_pool.pop() else {
+                eprintln!("buffer pool exhausted, dropping audio frame");
+                out_buffer.iter_mut().for_each(|s| *s = 0.0);
+                return portaudio::Continue;
+            };
             let in_buf = Arc::get_mut(&mut in_buffer_arc).unwrap();
             if let Some(source) = &mut capture_source {
                 if !copy_stream(source, in_buf) {
@@ -242,24 +254,17 @@ fn main() -> Result<(), Error> {
             
             worker_in_tx.send(in_buffer_arc).unwrap();
 
-            let mut out_buffer_arc = {
-                let mut buf = buffer_pool.pop().unwrap();
-                Arc::get_mut(&mut buf).unwrap().iter_mut().for_each(|s| *s = 0.0);
-                buf
-            };
+            render_buffer.iter_mut().for_each(|s| *s = 0.0);
 
             if let Some(source) = &mut render_source {
-                let out_buf = Arc::get_mut(&mut out_buffer_arc).unwrap();
-                if !copy_stream(source, out_buf) {
+                if !copy_stream(source, &mut render_buffer) {
                     should_continue = false;
                 }
             }
 
-            deinterleave(Arc::get_mut(&mut out_buffer_arc).unwrap(), &mut output_deinterleaved);
+            deinterleave(&render_buffer, &mut output_deinterleaved);
             processor.process_render_frame(&mut output_deinterleaved).unwrap();
             interleave(&output_deinterleaved, out_buffer);
-
-            let _ = buffer_pool.push(out_buffer_arc);
 
             if mute {
                 out_buffer.iter_mut().for_each(|m| *m = 0.0)
@@ -276,6 +281,7 @@ fn main() -> Result<(), Error> {
 
     let stream_settings = create_stream_settings(&pa, &processor, &opt)?;
     let mut stream = pa.open_non_blocking_stream(stream_settings, audio_callback)?;
+    barrier.wait();
     stream.start()?;
 
     ctrlc::set_handler({
@@ -296,62 +302,69 @@ fn main() -> Result<(), Error> {
 
 fn worker_thread(
     in_buffers: Receiver<SampleBuffer>,
+    in_path: &Option<PathBuf>,
     out_path: &Option<PathBuf>,
     buffer_pool: Arc<ArrayQueue<Arc<Vec<f32>>>>,
     num_channels: u16,
     frame_size: usize,
+    barrier: Arc::<Barrier>,
 ) {
     let num_ch = num_channels as usize;
-    let proc = ap::new(num_ch, frame_size);
+    let mut proc = ap::new(num_ch, frame_size, 
+        "/home/misha/coding/baby_rocs/3rdparty/DeepFilterNer/models/DeepFilterNet3_onnx.tar.gz",
+        80f32);
 
     // One DenoiseState per channel (rnnoise operates on mono 480-sample frames at 48kHz)
     // let mut denoise_states: Vec<Box<DenoiseState>> =
     //     (0..num_ch).map(|_| DenoiseState::new()).collect();
 
-    // Preallocate per-channel buffers for deinterleave/interleave
-    let mut channel_bufs: Vec<Vec<f32>> = (0..num_ch).map(|_| vec![0.0f32; frame_size]).collect();
-    let mut denoised_buf = vec![0.0f32; frame_size];
+    // Dedicated output buffer for processing — not taken from the shared pool.
+    let mut out_buffer = Arc::new(vec![0.0f32; frame_size * num_ch]);
 
-    let mut capture_preprocess_sink = if let Some(path) = out_path {
+    let mut capture_preprocess_sink = if let Some(path) = in_path {
         Some(open_wav_writer(path, num_channels).unwrap())
     } else {
         None
     };
+    let mut output_postprocess_sink = if let Some(path) = out_path {
+        Some(open_wav_writer(path, num_channels).unwrap())
+    } else {
+        None
+    };
+    
+    barrier.wait();
 
     loop {
         match in_buffers.recv() {
-            Ok(buf_in) => {
-                let mut in_buffer_arc = buffer_pool.pop().unwrap();
-                proc.process_frame(buf_in.clone(), &mut in_buffer_arc);
-                // Deinterleave into per-channel buffers
-                //for (i, sample) in buf_in.iter().enumerate() {
-                    //channel_bufs[i % num_ch][i / num_ch] = *sample;
-                //}
+            Ok(mut buf_in) => {
+                // Drain stale frames — if the worker fell behind (e.g. during model init),
+                // skip to the most recent frame and return skipped buffers to the pool.
+                while let Ok(newer) = in_buffers.try_recv() {
+                    let _ = buffer_pool.push(buf_in);
+                    buf_in = newer;
+                }
 
-                // Denoise each channel in-place
-                // rnnoise expects samples in i16 range (-32768..32767)
-                //for (ch, state) in denoise_states.iter_mut().enumerate() {
-                    //for s in channel_bufs[ch][..frame_size].iter_mut() {
-                        //*s *= 32767.0;
-                    //}
-                    //state.process_frame(&mut denoised_buf[..frame_size], &channel_bufs[ch][..frame_size]);
-                    //for s in denoised_buf[..frame_size].iter_mut() {
-                        //*s /= 32767.0;
-                    //}
-                    //channel_bufs[ch][..frame_size].copy_from_slice(&denoised_buf[..frame_size]);
-                //}
+                let snr = proc.process_frame(buf_in.clone(), &mut out_buffer);
+                println!("SNR: {snr}");
 
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {
                     for i in 0..frame_size {
                         for ch in 0..num_ch {
-                            sink.write_sample(in_buffer_arc[i]).unwrap();
+                            sink.write_sample(buf_in[i]).unwrap();
+                        }
+                    }
+                }
+                // Write denoised interleaved audio to sink
+                if let Some(sink) = &mut output_postprocess_sink {
+                    for i in 0..frame_size {
+                        for ch in 0..num_ch {
+                            sink.write_sample(out_buffer[i]).unwrap();
                         }
                     }
                 }
 
                 let _ = buffer_pool.push(buf_in);
-                let _ = buffer_pool.push(in_buffer_arc);
             }
             Err(_) => return,
         }

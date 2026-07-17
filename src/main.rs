@@ -3,22 +3,16 @@ use hound::{WavIntoSamples, WavReader, WavWriter};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
-    io::{BufReader, BufWriter},
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-        Barrier,
-        mpsc::{*}
-    },
-    thread,
-    time::Duration,
+    fs::{self, File}, io::{BufReader, BufWriter}, net::IpAddr, path::{Path, PathBuf}, sync::{
+        Arc, Barrier, atomic::{AtomicBool, Ordering}, mpsc::*
+    }, thread, time::Duration
 };
-use structopt::StructOpt;
+use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use webrtc_audio_processing::Processor;
 use webrtc_audio_processing_config::Config;
+
+use roc::ffi as rcs;
 
 mod common;
 use common::{deinterleave, interleave};
@@ -28,15 +22,27 @@ use audio_processing::{Processor as ap, SampleBuffer};
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_INTERLEAVED: bool = true;
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 struct Args {
     /// Configuration file that stores JSON serialization of [`Option`] struct.
-    #[structopt(short, long)]
+    #[arg(long)]
     pub config_file: Option<PathBuf>,
 
     /// List available audio devices and exit.
-    #[structopt(long)]
+    #[arg(long)]
     pub list_devices: bool,
+
+    #[arg(short='s', long)]
+    pub source: u16,
+    
+    #[arg(short='r', long)]
+    pub repair: Option<u16>,
+
+    #[arg(short='c', long)]
+    pub control: Option<u16>,
+
+    #[arg(short='d', long)]
+    pub destination_ip: IpAddr,
 }
 
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
@@ -164,7 +170,7 @@ fn copy_stream(source: &mut WavIntoSamples<BufReader<File>, f32>, dest: &mut [f3
 }
 
 fn main() -> Result<(), Error> {
-    let args = Args::from_args();
+    let args = Args::parse();
 
     let pa = portaudio::PortAudio::new()?;
 
@@ -211,8 +217,22 @@ fn main() -> Result<(), Error> {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_worker = barrier.clone();
     let frame_size = processor.num_samples_per_frame();
+    let destination_ip = args.destination_ip;
+    let source_port = args.source;
+    let repair_port = args.repair;
+    let control_port = args.control;
     let worker_thr = thread::spawn(move || {
-        worker_thread(worker_in_rx, &preprocess_sink_path, &postprocess_sink_path, buffer_pool_wrkr, num_channels, frame_size, barrier_worker);
+        worker_thread(worker_in_rx,
+            &preprocess_sink_path,
+            &postprocess_sink_path,
+            buffer_pool_wrkr,
+            num_channels,
+            frame_size,
+            barrier_worker,
+            destination_ip,
+            source_port,
+            repair_port,
+            control_port);
     });
 
     let audio_callback = {
@@ -308,15 +328,18 @@ fn worker_thread(
     num_channels: u16,
     frame_size: usize,
     barrier: Arc::<Barrier>,
+    roc_send_ip: IpAddr,
+    source_port: u16,
+    repair_port: Option<u16>,
+    control_port: Option<u16>,
 ) {
     let num_ch = num_channels as usize;
     let mut proc = ap::new(num_ch, frame_size, 
         "/home/misha/coding/baby_rocs/3rdparty/DeepFilterNer/models/DeepFilterNet3_onnx.tar.gz",
         80f32);
 
-    // One DenoiseState per channel (rnnoise operates on mono 480-sample frames at 48kHz)
-    // let mut denoise_states: Vec<Box<DenoiseState>> =
-    //     (0..num_ch).map(|_| DenoiseState::new()).collect();
+    let mut roc_sender = make_roc_sender(&roc_send_ip, source_port, repair_port, control_port)
+        .expect("failed to create roc sender");
 
     // Dedicated output buffer for processing — not taken from the shared pool.
     let mut out_buffer = Arc::new(vec![0.0f32; frame_size * num_ch]);
@@ -350,7 +373,7 @@ fn worker_thread(
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {
                     for i in 0..frame_size {
-                        for ch in 0..num_ch {
+                        for _ch in 0..num_ch {
                             sink.write_sample(buf_in[i]).unwrap();
                         }
                     }
@@ -358,11 +381,13 @@ fn worker_thread(
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut output_postprocess_sink {
                     for i in 0..frame_size {
-                        for ch in 0..num_ch {
+                        for _ch in 0..num_ch {
                             sink.write_sample(out_buffer[i]).unwrap();
                         }
                     }
                 }
+
+                roc_sender.write_slice(&out_buffer).result();
 
                 let _ = buffer_pool.push(buf_in);
             }
@@ -371,3 +396,69 @@ fn worker_thread(
     }
 }
 
+fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
+    -> Result<roc::sender::Sender, Error>{
+    roc::log::set_level(roc::log::Level::Debug);
+
+    let context_config = roc::config::Config::default();
+    let mut context = roc::context::Context::open(&context_config).result()?;
+
+    let sender_config = roc::config::SenderConfig::builder()
+        .frame_encoding(roc::config::MediaEncodingFactory::mono(
+            AUDIO_SAMPLE_RATE,
+            roc::config::Format::PCM_FLOAT32,
+        ))
+        .packet_encoding(roc::config::PacketEncoding::ACP_L16_STEREO)
+        .clock_source(rcs::roc_clock_source::ROC_CLOCK_SOURCE_EXTERNAL)
+        .build();
+
+    // ?# let sender = context.open_sender(&sender_config).result()?;
+    let mut sender = roc::sender::Sender::open(&mut context, &sender_config).result()?;
+
+    let source_endp = roc::endpoint::EndpointBuilder::new()
+        .host(roc_send_ip.to_string().to_owned())
+        .port(source_port)
+        .protocol(roc::network::config::Protocol::RTP_RS8M_SOURCE)
+        .build()
+        .result()?;
+
+    sender
+        .default_slot()
+        .connect(roc::config::Interface::AudioSource, &source_endp)
+        .result()?;
+
+    source_endp.deallocate();
+ 
+    if let Some(control_port) = control_port {
+        let control_endp = roc::endpoint::EndpointBuilder::new()
+            .host(roc_send_ip.to_string().to_owned())
+            .port(control_port)
+            .protocol(roc::network::config::Protocol::RTCP)
+            .build()
+            .result()?;
+
+        sender
+            .default_slot()
+            .connect(roc::config::Interface::AudioControl, &control_endp)
+            .result()?;
+
+        control_endp.deallocate();
+    }
+
+    if let Some(repair_port) = repair_port {
+        let repair_endp = roc::endpoint::EndpointBuilder::new()
+            .host(roc_send_ip.to_string().to_owned())
+            .port(repair_port)
+            .protocol(roc::network::config::Protocol::RS8M_REPAIR)
+            .build()
+            .result()?;
+
+        sender
+            .default_slot()
+            .connect(roc::config::Interface::AudioRepair, &repair_endp)
+            .result()?;
+
+        repair_endp.deallocate();
+    }
+    Ok(sender)
+}

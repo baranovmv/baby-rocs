@@ -335,10 +335,10 @@ fn worker_thread(
 ) {
     let num_ch = num_channels as usize;
     let mut proc = ap::new(num_ch, frame_size, 
-        "/home/misha/coding/baby_rocs/3rdparty/DeepFilterNer/models/DeepFilterNet3_onnx.tar.gz",
+        "models/DeepFilterNet3_onnx.tar.gz",
         80f32);
 
-    let mut roc_sender = make_roc_sender(&roc_send_ip, source_port, repair_port, control_port)
+    let (mut roc_sender, context) = make_roc_sender(&roc_send_ip, source_port, repair_port, control_port)
         .expect("failed to create roc sender");
 
     // Dedicated output buffer for processing — not taken from the shared pool.
@@ -397,7 +397,7 @@ fn worker_thread(
 }
 
 fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
-    -> Result<roc::sender::Sender, Error>{
+    -> Result<(roc::sender::Sender, roc::context::Context), Error>{
     roc::log::set_level(roc::log::Level::Debug);
 
     let context_config = roc::config::Config::default();
@@ -460,5 +460,5 @@ fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u
 
         repair_endp.deallocate();
     }
-    Ok(sender)
+    Ok((sender, context))
 }

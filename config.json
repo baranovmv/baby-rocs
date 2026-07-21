@@ -15,4 +15,10 @@
             level: "High",
         },
     },
+    roc_send: {
+        destination: "127.0.0.1",
+        source:  10101,
+        repair:  10102,
+        control: 10103,
+    },
 }

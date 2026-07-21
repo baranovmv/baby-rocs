@@ -16,7 +16,7 @@ pub struct Processor {
 }
 
 impl Processor {
-    pub fn new(num_channels: usize, frame_sz: usize, model_path: &str, atten_lim: f32) -> Self {
+    pub fn new(num_channels: usize, frame_sz: usize, model_path: PathBuf, atten_lim: f32) -> Self {
         let channel_buf = vec![0.0f32; frame_sz];
         let denoised_buf = vec![0.0f32; frame_sz];
 
@@ -29,7 +29,7 @@ impl Processor {
         r_params = r_params.with_post_filter(0.0f32);  //post_filter_beta
         r_params = r_params.with_mask_reduce(ReduceMask::MAX);  //reduce_mask
         let df_params =
-            DfParams::new(PathBuf::from(model_path)).expect("Could not load model from path");
+            DfParams::new(model_path).expect(format!("Could not load model file").as_ref());
         let m =
             DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime.");
         println!("num_channels: {num_channels}, frame_sz: {frame_sz}, hop_size: {0}", m.hop_size);

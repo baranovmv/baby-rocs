@@ -32,17 +32,8 @@ struct Args {
     #[arg(long)]
     pub list_devices: bool,
 
-    #[arg(short='s', long)]
-    pub source: u16,
-    
-    #[arg(short='r', long)]
-    pub repair: Option<u16>,
-
-    #[arg(short='c', long)]
-    pub control: Option<u16>,
-
-    #[arg(short='d', long)]
-    pub destination_ip: IpAddr,
+    #[arg(long)]
+    pub model: Option<PathBuf>
 }
 
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
@@ -81,6 +72,16 @@ struct Options {
     render: RenderOptions,
     /// Configurations of the audio processing pipeline.
     config: Config,
+    /// Config for roc-send node
+    roc_send: Option<RocSendOptions>,
+}
+ 
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+struct RocSendOptions {
+    destination: String,
+    source: u16,
+    repair: Option<u16>,
+    control: Option<u16>,
 }
 
 fn match_device(
@@ -98,22 +99,23 @@ fn match_device(
 fn create_stream_settings(
     pa: &portaudio::PortAudio,
     processor: &Processor,
-    opt: &Options,
+    render_options: &RenderOptions,
+    capture_options: &CaptureOptions,
 ) -> Result<portaudio::DuplexStreamSettings<f32, f32>, Error> {
-    let input_device = match_device(pa, Regex::new(&opt.capture.device_name)?)?;
+    let input_device = match_device(pa, Regex::new(&capture_options.device_name)?)?;
     let input_device_info = &pa.device_info(input_device)?;
     let input_params = portaudio::StreamParameters::<f32>::new(
         input_device,
-        opt.capture.num_channels as i32,
+        capture_options.num_channels as i32,
         AUDIO_INTERLEAVED,
         input_device_info.default_low_input_latency,
     );
 
-    let output_device = match_device(pa, Regex::new(&opt.render.device_name)?)?;
+    let output_device = match_device(pa, Regex::new(&render_options.device_name)?)?;
     let output_device_info = &pa.device_info(output_device)?;
     let output_params = portaudio::StreamParameters::<f32>::new(
         output_device,
-        opt.render.num_channels as i32,
+        render_options.num_channels as i32,
         AUDIO_INTERLEAVED,
         output_device_info.default_low_output_latency,
     );
@@ -217,10 +219,7 @@ fn main() -> Result<(), Error> {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_worker = barrier.clone();
     let frame_size = processor.num_samples_per_frame();
-    let destination_ip = args.destination_ip;
-    let source_port = args.source;
-    let repair_port = args.repair;
-    let control_port = args.control;
+    let roc_opts = opt.roc_send;
     let worker_thr = thread::spawn(move || {
         worker_thread(worker_in_rx,
             &preprocess_sink_path,
@@ -229,10 +228,8 @@ fn main() -> Result<(), Error> {
             num_channels,
             frame_size,
             barrier_worker,
-            destination_ip,
-            source_port,
-            repair_port,
-            control_port);
+            args.model,
+            roc_opts);
     });
 
     let audio_callback = {
@@ -299,7 +296,7 @@ fn main() -> Result<(), Error> {
         }
     };
 
-    let stream_settings = create_stream_settings(&pa, &processor, &opt)?;
+    let stream_settings = create_stream_settings(&pa, &processor, &opt.render, &opt.capture)?;
     let mut stream = pa.open_non_blocking_stream(stream_settings, audio_callback)?;
     barrier.wait();
     stream.start()?;
@@ -328,18 +325,25 @@ fn worker_thread(
     num_channels: u16,
     frame_size: usize,
     barrier: Arc::<Barrier>,
-    roc_send_ip: IpAddr,
-    source_port: u16,
-    repair_port: Option<u16>,
-    control_port: Option<u16>,
+    model: Option<PathBuf>,
+    roc_opts: Option<RocSendOptions>
 ) {
     let num_ch = num_channels as usize;
     let mut proc = ap::new(num_ch, frame_size, 
-        "models/DeepFilterNet3_onnx.tar.gz",
+        model.unwrap_or(
+        PathBuf::from("models/DeepFilterNet3_onnx.tar.gz")),
         80f32);
 
-    let (mut roc_sender, context) = make_roc_sender(&roc_send_ip, source_port, repair_port, control_port)
-        .expect("failed to create roc sender");
+    let (mut roc_sender, context,) = if let Some(roc_opts) = roc_opts {
+        let (roc_sender, context,) = make_roc_sender(
+                roc_opts.destination.clone(),
+                roc_opts.source,
+                roc_opts.repair,
+               roc_opts.control).expect("failed to create roc sender");
+        (Some(roc_sender), Some(context),)
+    } else {
+        (None, None,)
+    };
 
     // Dedicated output buffer for processing — not taken from the shared pool.
     let mut out_buffer = Arc::new(vec![0.0f32; frame_size * num_ch]);
@@ -387,8 +391,9 @@ fn worker_thread(
                     }
                 }
 
-                roc_sender.write_slice(&out_buffer).result();
-
+                if let Some(roc_sender) = &mut roc_sender {
+                    roc_sender.write_slice(&out_buffer).result();
+                }
                 let _ = buffer_pool.push(buf_in);
             }
             Err(_) => return,
@@ -396,7 +401,7 @@ fn worker_thread(
     }
 }
 
-fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
+fn make_roc_sender(roc_send_ip: String, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
     -> Result<(roc::sender::Sender, roc::context::Context), Error>{
     roc::log::set_level(roc::log::Level::Debug);
 
@@ -416,7 +421,7 @@ fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u
     let mut sender = roc::sender::Sender::open(&mut context, &sender_config).result()?;
 
     let source_endp = roc::endpoint::EndpointBuilder::new()
-        .host(roc_send_ip.to_string().to_owned())
+        .host(roc_send_ip.clone())
         .port(source_port)
         .protocol(roc::network::config::Protocol::RTP_RS8M_SOURCE)
         .build()
@@ -431,7 +436,7 @@ fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u
  
     if let Some(control_port) = control_port {
         let control_endp = roc::endpoint::EndpointBuilder::new()
-            .host(roc_send_ip.to_string().to_owned())
+            .host(roc_send_ip.clone())
             .port(control_port)
             .protocol(roc::network::config::Protocol::RTCP)
             .build()
@@ -447,7 +452,7 @@ fn make_roc_sender(roc_send_ip: &IpAddr, source_port: u16, repair_port: Option<u
 
     if let Some(repair_port) = repair_port {
         let repair_endp = roc::endpoint::EndpointBuilder::new()
-            .host(roc_send_ip.to_string().to_owned())
+            .host(roc_send_ip.clone())
             .port(repair_port)
             .protocol(roc::network::config::Protocol::RS8M_REPAIR)
             .build()

@@ -44,7 +44,5 @@ impl Processor {
         let mut output = ArrayViewMut2::from_shape((1, self.m.hop_size), Arc::get_mut(out_buffer).unwrap().as_mut_slice()).unwrap();
 
         self.m.process(input, output).expect("Failed to process DF frame")
-        // Arc::get_mut(out_buffer).unwrap().clear();
-        // Arc::get_mut(out_buffer).unwrap().extend_from_slice(in_buffer.as_slice());
     }
 }

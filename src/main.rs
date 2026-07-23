@@ -18,6 +18,8 @@ mod common;
 use common::{deinterleave, interleave};
 mod audio_processing;
 use audio_processing::{Processor as ap, SampleBuffer};
+mod ui;
+use ui::Shared;
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_INTERLEAVED: bool = true;
@@ -90,6 +92,7 @@ struct RocSendOptions {
 struct ProcessingOptions {
     snr_threshold: f32,
     snr_timeout: f32,
+    deepfilternet_enabled: bool,
 }
 
 fn match_device(
@@ -228,6 +231,28 @@ fn main() -> Result<(), Error> {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_worker = barrier.clone();
     let roc_opts = opt.roc_send;
+
+    // Runtime state shared between the audio worker and the TUI.
+    let shared = Arc::new(Shared::new(
+        opt.processing.snr_threshold,
+        opt.processing.snr_timeout,
+    ));
+
+    // Route roc-toolkit log messages into the UI's log tab.
+    roc::log::set_level(roc::log::Level::Debug);
+    {
+        let shared = shared.clone();
+        roc::log::set_handler_async(move |msg| {
+            let text = match (&msg.module, &msg.text) {
+                (Some(module), Some(text)) => format!("[{module}] {text}"),
+                (None, Some(text)) => text.clone(),
+                _ => String::new(),
+            };
+            shared.push_log(msg.level, text);
+        });
+    }
+
+    let shared_worker = shared.clone();
     let worker_thr = thread::spawn(move || {
         worker_thread(worker_in_rx,
             &preprocess_sink_path,
@@ -237,7 +262,7 @@ fn main() -> Result<(), Error> {
             frame_size,
             barrier_worker,
             args.model,
-            roc_opts, opt.processing);
+            roc_opts, shared_worker);
     });
 
     let audio_callback = {
@@ -314,12 +339,32 @@ fn main() -> Result<(), Error> {
         }
     })?;
 
-    while RUNNING.load(Ordering::SeqCst) {
-        thread::sleep(time::Duration::from_millis(10));
+    // Run the TUI until the user quits or the audio pipeline stops.
+    ui::crossterm::run(shared.clone(), RUNNING.clone())?;
+
+    // Stop the stream and drop it so the worker's channel sender is released,
+    // letting the worker thread finish and finalize its WAV sinks.
+    let _ = stream.stop();
+    drop(stream);
+    let _ = worker_thr.join();
+
+    // Persist runtime-edited processing values back to the config file.
+    if let Err(e) = persist_config(&config_file, &shared) {
+        eprintln!("Failed to write config: {e}");
     }
 
     println!("{:#?}", wap_processor.get_stats());
 
+    Ok(())
+}
+
+/// Re-read the config file, update the processing options with the values
+/// edited at runtime, and write it back out.
+fn persist_config(path: &Path, shared: &Shared) -> Result<(), Error> {
+    let mut opt: Options = json5::from_str(&fs::read_to_string(path)?)?;
+    opt.processing.snr_threshold = shared.snr_threshold();
+    opt.processing.snr_timeout = shared.snr_timeout();
+    fs::write(path, json5::to_string(&opt)?)?;
     Ok(())
 }
 
@@ -333,7 +378,7 @@ fn worker_thread(
     barrier: Arc::<Barrier>,
     model: Option<PathBuf>,
     roc_opts: Option<RocSendOptions>,
-    processing_opt: ProcessingOptions,
+    shared: Arc<Shared>,
 ) {
     let num_ch = num_channels as usize;
     let mut proc = ap::new(num_ch, frame_size, 
@@ -342,11 +387,9 @@ fn worker_thread(
         80f32);
 
     let mut roc_sender = if roc_opts.is_some() {
-        let roc_sender = RocTimedSender::new(roc_opts.unwrap(),
-            time::Duration::from_secs_f32(processing_opt.snr_timeout),
-            processing_opt.snr_threshold);
+        let roc_sender = RocTimedSender::new(roc_opts.unwrap(), shared.clone());
         if roc_sender.is_err() {
-            eprintln!("Can't create roc-sender");
+            shared.push_log(roc::log::Level::Error, "Can't create roc-sender");
             RUNNING.store(false, Ordering::SeqCst);
             return;
         }
@@ -379,7 +422,9 @@ fn worker_thread(
                     buf_in = newer;
                 }
 
+                proc.enable_denoise(shared.deepfilternet_enabled());
                 let snr = proc.process_frame(buf_in.clone(), &mut out_buffer);
+                shared.set_current_snr(snr);
 
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {
@@ -399,16 +444,18 @@ fn worker_thread(
                 }
 
                 if let Some(roc_sender) = &mut roc_sender {
-                    roc_sender.send(&out_buffer, snr).unwrap_or_else(|_| {
-                        eprintln!("Can't send frame");
+                    if let Ok(sending) = roc_sender.send(&out_buffer, snr) {
+                        shared.set_sending(sending);
+                    } else {
+                        shared.push_log(roc::log::Level::Error, "Can't send frame");
                         RUNNING.store(false, Ordering::SeqCst);
                         return;
-                    });
+                    }
                 }
                 let _ = buffer_pool.push(buf_in);
             }
             Err(_) => {
-                eprintln!("Error while getting a buffer");
+                shared.push_log(roc::log::Level::Error, "Error while getting a buffer");
                 RUNNING.store(false, Ordering::SeqCst);
                 return
             }
@@ -421,51 +468,55 @@ struct RocTimedSender {
     context: roc::context::Context,
     sender: Option<roc::sender::Sender>,
     first_silent_ts: std::time::Instant,
-    timeout: std::time::Duration,
-    snr_threshold: f32
+    shared: Arc<Shared>,
 }
 
 impl RocTimedSender {
-    fn new(config: RocSendOptions, timeout: time::Duration, snr_threshold: f32) -> Result<Self, Error> {
+    fn new(config: RocSendOptions, shared: Arc<Shared>) -> Result<Self, Error> {
         let context_config = roc::config::Config::default();
         let context = roc::context::Context::open(&context_config).result()?;
-        roc::log::set_level(roc::log::Level::Debug);
         Ok(Self {
             config,
             context,
             sender: None,
             first_silent_ts: time::Instant::now(),
-            timeout,
-            snr_threshold
+            shared,
         })
     }
 
-    fn send(&mut self, frame: &[f32], snr: f32) -> Result<(), Error> {
-        if snr < self.snr_threshold && self.sender.is_none() {
-            return Ok(());
-        } else if snr >= self.snr_threshold && self.sender.is_none() {
-            let roc_sender = self.make_roc_sender(
+    fn send(&mut self, frame: &[f32], snr: f32) -> Result<bool, Error> {
+        // Read live control values edited via the UI.
+        let bypass = self.shared.bypass();
+        let threshold = self.shared.snr_threshold();
+        let timeout = time::Duration::from_secs_f32(self.shared.snr_timeout());
+        let above = bypass || snr >= threshold;
+
+        if !above && self.sender.is_none() {
+            return Ok(self.sender.is_some());
+        } else if above && self.sender.is_none() {
+            let roc_sender = self.make_sender(
                 self.config.destination.clone(),
                 self.config.source,
                 self.config.repair,
                self.config.control).expect("failed to create roc sender");
             self.sender = Some(roc_sender);
-            println!("Start sending, SNR {snr}");
+            self.shared
+                .push_log(roc::log::Level::Info, format!("Start sending, SNR {snr}"));
         }
 
         self.sender.as_mut().unwrap().write_slice(frame).result()?;
 
-        if snr >= self.snr_threshold {
+        if above {
             self.first_silent_ts = time::Instant::now();
-            println!("SNR: {snr}");
-        } else if  self.first_silent_ts.elapsed() >= self.timeout {
-            println!("Timeout, send off");
+        } else if self.first_silent_ts.elapsed() >= timeout {
+            self.shared
+                .push_log(roc::log::Level::Info, "Timeout, send off");
             self.sender = None;
         }
-        Ok(())
+        Ok(self.sender.is_some())
     }
 
-    fn make_roc_sender(&mut self, roc_send_ip: String, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
+    fn make_sender(&mut self, roc_send_ip: String, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
         -> Result<roc::sender::Sender, Error>{
 
         let sender_config = roc::config::SenderConfig::builder()

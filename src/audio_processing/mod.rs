@@ -13,6 +13,8 @@ pub struct Processor {
     denoised_buf: Vec<f32>,
     frame_sz: usize,
     m: tract::DfTract,
+    snr_status: f32,
+    enable: bool,
 }
 
 impl Processor {
@@ -33,16 +35,24 @@ impl Processor {
         let m =
             DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime.");
         println!("num_channels: {num_channels}, frame_sz: {frame_sz}, hop_size: {0}", m.hop_size);
-        Self { num_channels, channel_buf, denoised_buf, frame_sz, m }
+        Self { num_channels, channel_buf, denoised_buf, frame_sz, m, snr_status: 0f32, enable: true}
     }
 
     pub fn process_frame(&mut self, in_buffer: SampleBuffer, out_buffer: &mut SampleBuffer) -> f32 {
         assert_eq!(in_buffer.len(), self.frame_sz);
         assert!(out_buffer.capacity() >= in_buffer.len());
-        
-        let input = ArrayView2::from_shape((1, self.m.hop_size), in_buffer.as_slice()).unwrap();
-        let mut output = ArrayViewMut2::from_shape((1, self.m.hop_size), Arc::get_mut(out_buffer).unwrap().as_mut_slice()).unwrap();
+        if !self.enable { return -15f32; }
 
-        self.m.process(input, output).expect("Failed to process DF frame")
+        let input = ArrayView2::from_shape((1, self.m.hop_size), in_buffer.as_slice()).unwrap();
+        let output = ArrayViewMut2::from_shape((1, self.m.hop_size), Arc::get_mut(out_buffer).unwrap().as_mut_slice()).unwrap();
+
+        let new_snr = self.m.process(input, output).expect("Failed to process DF frame");
+        let alpha = 0.97;
+        self.snr_status = f32::max(self.snr_status * alpha, new_snr);
+        self.snr_status
+    }
+
+    pub fn enable_denoise(&mut self, enable: bool) {
+        self.enable = enable;
     }
 }

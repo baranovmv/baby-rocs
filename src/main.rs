@@ -236,6 +236,7 @@ fn main() -> Result<(), Error> {
     let shared = Arc::new(Shared::new(
         opt.processing.snr_threshold,
         opt.processing.snr_timeout,
+        opt.processing.deepfilternet_enabled,
     ));
 
     // Route roc-toolkit log messages into the UI's log tab.
@@ -364,6 +365,7 @@ fn persist_config(path: &Path, shared: &Shared) -> Result<(), Error> {
     let mut opt: Options = json5::from_str(&fs::read_to_string(path)?)?;
     opt.processing.snr_threshold = shared.snr_threshold();
     opt.processing.snr_timeout = shared.snr_timeout();
+    opt.processing.deepfilternet_enabled = shared.deepfilternet_enabled();
     fs::write(path, json5::to_string(&opt)?)?;
     Ok(())
 }
@@ -382,8 +384,7 @@ fn worker_thread(
 ) {
     let num_ch = num_channels as usize;
     let mut proc = ap::new(num_ch, frame_size, 
-        model.unwrap_or(
-        PathBuf::from("models/DeepFilterNet3_onnx.tar.gz")),
+        model,
         80f32);
 
     let mut roc_sender = if roc_opts.is_some() {
@@ -412,6 +413,9 @@ fn worker_thread(
     
     barrier.wait();
 
+    // Frames per periodic debug log (~1s at 10 ms/frame).
+    const LOG_EVERY_FRAMES: u64 = 100;
+
     loop {
         match in_buffers.recv() {
             Ok(mut buf_in) => {
@@ -425,6 +429,10 @@ fn worker_thread(
                 proc.enable_denoise(shared.deepfilternet_enabled());
                 let snr = proc.process_frame(buf_in.clone(), &mut out_buffer);
                 shared.set_current_snr(snr);
+
+                // Publish the input level (dBFS) for the level meter.
+                let level_dbfs = proc.level_dbfs();
+                shared.set_current_level(level_dbfs);
 
                 // Write denoised interleaved audio to sink
                 if let Some(sink) = &mut capture_preprocess_sink {

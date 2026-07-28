@@ -1,8 +1,11 @@
+#[cfg(feature = "deepfilternet")]
 use df::*;
+#[cfg(feature = "deepfilternet")]
 use ndarray::prelude::*;
+#[cfg(feature = "deepfilternet")]
+use df::tract::{*};
 use std::sync::Arc;
 use std::path::PathBuf;
-use df::tract::{*};
 
 
 pub type SampleBuffer = Arc<Vec<f32>>;
@@ -18,9 +21,11 @@ pub struct Processor {
     channel_buf: Vec<f32>,
     denoised_buf: Vec<f32>,
     frame_sz: usize,
+    #[cfg(feature = "deepfilternet")]
     m: Option<tract::DfTract>,
     snr_status: f32,
     level_rms: f32,
+    #[cfg(feature = "deepfilternet")]
     enable: bool,
 }
 
@@ -29,29 +34,37 @@ impl Processor {
         let channel_buf = vec![0.0f32; frame_sz];
         let denoised_buf = vec![0.0f32; frame_sz];
 
-        let m = if model_path.is_some() {
-            let model_path = model_path.unwrap();
-            let mut r_params = RuntimeParams::default_with_ch(num_channels);
-            r_params = r_params.with_atten_lim(atten_lim).with_thresholds(
-                -15.0f32,  //min_db_thresh
-                35.0f32,   //max_db_erb_thresh
-                35.0f32,   //max_db_df_thresh
-            );
-            r_params = r_params.with_post_filter(0.0f32);  //post_filter_beta
-            r_params = r_params.with_mask_reduce(ReduceMask::MAX);  //reduce_mask
-            let df_params =
-                DfParams::new(model_path).expect(format!("Could not load model file").as_ref());
+        #[cfg(feature = "deepfilternet")]
+        {
+            let m = if model_path.is_some() {
+                let model_path = model_path.unwrap();
+                let mut r_params = RuntimeParams::default_with_ch(num_channels);
+                r_params = r_params.with_atten_lim(atten_lim).with_thresholds(
+                    -15.0f32,  //min_db_thresh
+                    35.0f32,   //max_db_erb_thresh
+                    35.0f32,   //max_db_df_thresh
+                );
+                r_params = r_params.with_post_filter(0.0f32);  //post_filter_beta
+                r_params = r_params.with_mask_reduce(ReduceMask::MAX);  //reduce_mask
+                let df_params =
+                    DfParams::new(model_path).expect(format!("Could not load model file").as_ref());
 
-            Some(DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime."))
-        } else { 
-            None 
-        };
-        if let Some(ref some_m) = m {
-            println!("num_channels: {num_channels}, frame_sz: {frame_sz}, hop_size: {0}", some_m.hop_size);
-        } else {
-            println!("No model provided, DeepFilterNet disabled");
+                Some(DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime."))
+            } else { 
+                None 
+            };
+            if let Some(ref some_m) = m {
+                println!("num_channels: {num_channels}, frame_sz: {frame_sz}, hop_size: {0}", some_m.hop_size);
+            } else {
+                println!("No model provided, DeepFilterNet disabled");
+            }
         }
-        Self { num_channels, channel_buf, denoised_buf, frame_sz, m, snr_status: 0f32, level_rms: 0f32, enable: true}
+        Self { num_channels, channel_buf, denoised_buf, frame_sz, 
+            #[cfg(feature = "deepfilternet")]
+            m,
+            snr_status: 0f32, level_rms: 0f32,
+            #[cfg(feature = "deepfilternet")]
+            enable: true}
     }
 
     pub fn process_frame(&mut self, in_buffer: SampleBuffer, out_buffer: &mut SampleBuffer) -> f32 {
@@ -65,21 +78,23 @@ impl Processor {
         let rms = (sum_sq / self.frame_sz as f32).sqrt();
         self.level_rms = f32::max(self.level_rms * SMOOTHING_ALPHA, rms);
 
-        if let Some(ref mut m) = self.m && self.enable {
-            let input = ArrayView2::from_shape((1, m.hop_size), in_buffer.as_slice()).unwrap();
-            let output = ArrayViewMut2::from_shape((1, m.hop_size), Arc::get_mut(out_buffer).unwrap().as_mut_slice()).unwrap();
+        #[cfg(feature = "deepfilternet")]
+        {
+            if let Some(ref mut m) = self.m && self.enable {
+                let input = ArrayView2::from_shape((1, m.hop_size), in_buffer.as_slice()).unwrap();
+                let output = ArrayViewMut2::from_shape((1, m.hop_size), Arc::get_mut(out_buffer).unwrap().as_mut_slice()).unwrap();
 
-            let new_snr = m.process(input, output).expect("Failed to process DF frame");
-            self.snr_status = f32::max(self.snr_status * SMOOTHING_ALPHA, new_snr);
-            self.snr_status
-        } else {
-            let y = Arc::get_mut(out_buffer).unwrap().as_mut_slice();
-            for (i, x) in in_buffer.iter().enumerate() {
-                y[i] = *x;
+                let new_snr = m.process(input, output).expect("Failed to process DF frame");
+                self.snr_status = f32::max(self.snr_status * SMOOTHING_ALPHA, new_snr);
+                return self.snr_status
             }
-            assert!(in_buffer.len() == out_buffer.len());
-            -15f32
         }
+        let y = Arc::get_mut(out_buffer).unwrap().as_mut_slice();
+        for (i, x) in in_buffer.iter().enumerate() {
+            y[i] = *x;
+        }
+        assert!(in_buffer.len() == out_buffer.len());
+        -15f32
     }
 
     /// Smoothed input level in dBFS (full scale = 1.0).
@@ -87,6 +102,7 @@ impl Processor {
         20.0 * self.level_rms.max(RMS_FLOOR).log10()
     }
 
+    #[cfg(feature = "deepfilternet")]
     pub fn enable_denoise(&mut self, enable: bool) {
         self.enable = enable;
     }

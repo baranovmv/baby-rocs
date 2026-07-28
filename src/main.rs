@@ -25,6 +25,7 @@ mod common;
 use common::{deinterleave, interleave};
 mod audio_processing;
 use audio_processing::{Processor as ap, SampleBuffer};
+
 mod ui;
 use ui::Shared;
 
@@ -41,6 +42,7 @@ struct Args {
     #[arg(long)]
     pub list_devices: bool,
 
+    #[cfg(feature = "deepfilternet")]
     #[arg(long)]
     pub model: Option<PathBuf>,
 }
@@ -97,8 +99,10 @@ struct RocSendOptions {
 
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
 struct ProcessingOptions {
+    bypass: bool,
     snr_threshold: f32,
     snr_timeout: f32,
+    #[cfg(feature = "deepfilternet")]
     deepfilternet_enabled: bool,
 }
 
@@ -252,14 +256,19 @@ fn main() -> Result<(), Error> {
 
     // Runtime state shared between the audio worker and the TUI.
     let shared = Arc::new(Shared::new(
+        opt.processing.bypass,
         opt.processing.snr_threshold,
         opt.processing.snr_timeout,
+        #[cfg(feature = "deepfilternet")]
         opt.processing.deepfilternet_enabled,
+        #[cfg(not(feature = "deepfilternet"))]
+        false,
     ));
 
-    // Route roc-toolkit log messages into the UI's log tab.
-    roc::log::set_level(roc::log::Level::Debug);
+    #[cfg(feature = "tui")]
     {
+        // Route roc-toolkit log messages into the UI's log tab.
+        roc::log::set_level(roc::log::Level::Debug);
         let shared = shared.clone();
         roc::log::set_handler_async(move |msg| {
             let text = match (&msg.module, &msg.text) {
@@ -281,7 +290,10 @@ fn main() -> Result<(), Error> {
             num_channels,
             frame_size,
             barrier_worker,
+            #[cfg(feature = "deepfilternet")]
             args.model,
+            #[cfg(not(feature = "deepfilternet"))]
+            None,
             roc_opts,
             shared_worker,
         );
@@ -369,9 +381,17 @@ fn main() -> Result<(), Error> {
         }
     })?;
 
-    // Run the TUI until the user quits or the audio pipeline stops.
-    ui::crossterm::run(shared.clone(), RUNNING.clone())?;
-
+    #[cfg(feature = "tui")]
+    {
+        // Run the TUI until the user quits or the audio pipeline stops.
+        ui::crossterm::run(shared.clone(), RUNNING.clone())?;
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        while RUNNING.load(Ordering::Relaxed) {
+            sleep(std::time::Duration::from_millis(100));
+        }
+    }
     // Stop the stream and drop it so the worker's channel sender is released,
     // letting the worker thread finish and finalize its WAV sinks.
     let _ = stream.stop();
@@ -379,6 +399,7 @@ fn main() -> Result<(), Error> {
     let _ = worker_thr.join();
 
     // Persist runtime-edited processing values back to the config file.
+    #[cfg(feature = "tui")]
     if let Err(e) = persist_config(&config_file, &shared) {
         eprintln!("Failed to write config: {e}");
     }
@@ -390,11 +411,16 @@ fn main() -> Result<(), Error> {
 
 /// Re-read the config file, update the processing options with the values
 /// edited at runtime, and write it back out.
+#[cfg(feature = "tui")]
 fn persist_config(path: &Path, shared: &Shared) -> Result<(), Error> {
     let mut opt: Options = json5::from_str(&fs::read_to_string(path)?)?;
     opt.processing.snr_threshold = shared.snr_threshold();
     opt.processing.snr_timeout = shared.snr_timeout();
-    opt.processing.deepfilternet_enabled = shared.deepfilternet_enabled();
+    opt.processing.bypass = shared.bypass();
+    #[cfg(feature = "deepfilternet")]
+    {
+        opt.processing.deepfilternet_enabled = shared.deepfilternet_enabled();
+    }
     fs::write(path, json5::to_string(&opt)?)?;
     Ok(())
 }
@@ -412,6 +438,7 @@ fn worker_thread(
     shared: Arc<Shared>,
 ) {
     let num_ch = num_channels as usize;
+    let model_present = model.is_some();
     let mut proc = ap::new(num_ch, frame_size, model, 80f32);
 
     let mut roc_sender = if roc_opts.is_some() {
@@ -470,11 +497,13 @@ fn worker_thread(
                     dropped_frames += 1;
                 }
 
+                #[cfg(feature = "deepfilternet")]
                 proc.enable_denoise(shared.deepfilternet_enabled());
                 let denoise_on = shared.deepfilternet_enabled();
                 let t0 = time::Instant::now();
                 let snr = proc.process_frame(buf_in.clone(), &mut out_buffer);
                 let elapsed = t0.elapsed();
+
                 shared.set_current_snr(snr);
 
                 // Only accumulate the real-time factor while DeepFilterNet is
@@ -487,21 +516,24 @@ fn worker_thread(
                     rtf_count += 1;
                 }
 
-                if rtf_window_start.elapsed() >= RTF_REPORT_INTERVAL {
-                    if rtf_count > 0 {
-                        let avg = rtf_sum / rtf_count as f32;
-                        shared.push_log(
-                            roc::log::Level::Info,
-                            format!(
-                                "DFN RTF avg={avg:.2}x max={rtf_max:.2}x (n={rtf_count}, dropped={dropped_frames}) / 5s"
-                            ),
-                        );
+                #[cfg(feature = "tui")]
+                {
+                    if rtf_window_start.elapsed() >= RTF_REPORT_INTERVAL && model_present {
+                        if rtf_count > 0 {
+                            let avg = rtf_sum / rtf_count as f32;
+                            shared.push_log(
+                                roc::log::Level::Info,
+                                format!(
+                                    "DFN RTF avg={avg:.2}x max={rtf_max:.2}x (n={rtf_count}, dropped={dropped_frames}) / 5s"
+                                ),
+                            );
+                        }
+                        rtf_window_start = time::Instant::now();
+                        rtf_sum = 0.0;
+                        rtf_max = 0.0;
+                        rtf_count = 0;
+                        dropped_frames = 0;
                     }
-                    rtf_window_start = time::Instant::now();
-                    rtf_sum = 0.0;
-                    rtf_max = 0.0;
-                    rtf_count = 0;
-                    dropped_frames = 0;
                 }
 
                 // Publish the input level (dBFS) for the level meter.

@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crossbeam_queue::ArrayQueue;
 
+#[cfg(feature = "tui")]
 pub mod app;
+#[cfg(feature = "tui")]
 pub mod crossterm;
+#[cfg(feature = "tui")]
 pub mod ui;
 
 /// Range of the SNR gauge / threshold control, in dB.
@@ -53,13 +56,13 @@ pub struct Shared {
 
 impl Shared {
     /// Create shared state seeded from the configured processing options.
-    pub fn new(snr_threshold: f32, snr_timeout: f32, deepfilternet_enabled: bool) -> Self {
+    pub fn new(bypass: bool, snr_threshold: f32, snr_timeout: f32, deepfilternet_enabled: bool) -> Self {
         Self {
             current_snr: AtomicU32::new(SNR_MIN.to_bits()),
             current_level: AtomicU32::new(LEVEL_MIN_DBFS.to_bits()),
             snr_threshold: AtomicU32::new(snr_threshold.to_bits()),
             snr_timeout: AtomicU32::new(snr_timeout.to_bits()),
-            bypass: AtomicBool::new(false),
+            bypass: AtomicBool::new(bypass),
             sending: AtomicBool::new(false),
             deepfilternet_enabled: AtomicBool::new(deepfilternet_enabled),
             logs: ArrayQueue::new(LOG_CAPACITY),
@@ -126,6 +129,7 @@ impl Shared {
 
     /// push a log line, overwriting the oldest entry when the ring is full.
     pub fn push_log(&self, level: roc::log::Level, text: impl Into<String>) {
+        #[cfg(feature = "tui")]
         self.logs.force_push(LogLine { level, text: text.into() });
     }
 

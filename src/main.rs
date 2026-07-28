@@ -1,15 +1,22 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
+use clap::Parser;
+use crossbeam_queue::ArrayQueue;
 use hound::{WavIntoSamples, WavReader, WavWriter};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File}, io::{BufReader, BufWriter}, net::IpAddr, path::{Path, PathBuf}, sync::{
-        Arc, Barrier, atomic::{AtomicBool, Ordering}, mpsc::*
-    }, thread, time,
-    sync::{LazyLock},
+    fs::{self, File},
+    io::{BufReader, BufWriter},
+    net::IpAddr,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc::*,
+    },
+    thread, time,
 };
-use clap::Parser;
-use crossbeam_queue::ArrayQueue;
 use webrtc_audio_processing as wap;
 
 use roc::ffi as rcs;
@@ -35,7 +42,7 @@ struct Args {
     pub list_devices: bool,
 
     #[arg(long)]
-    pub model: Option<PathBuf>
+    pub model: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
@@ -79,7 +86,7 @@ struct Options {
     /// Various sound processing options
     processing: ProcessingOptions,
 }
- 
+
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
 struct RocSendOptions {
     destination: String,
@@ -104,7 +111,10 @@ fn match_device(
             return Ok(device.0);
         }
     }
-    Err(anyhow!("Audio device matching \"{}\" not found.", device_name))
+    Err(anyhow!(
+        "Audio device matching \"{}\" not found.",
+        device_name
+    ))
 }
 
 fn create_stream_settings(
@@ -182,7 +192,7 @@ fn copy_stream(source: &mut WavIntoSamples<BufReader<File>, f32>, dest: &mut [f3
     !source_eof
 }
 
-static RUNNING: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| {Arc::new(true.into())});
+static RUNNING: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(true.into()));
 
 fn main() -> Result<(), Error> {
     let args = Args::parse();
@@ -202,7 +212,9 @@ fn main() -> Result<(), Error> {
         return Ok(());
     }
 
-    let config_file = args.config_file.ok_or_else(|| anyhow!("--config-file is required"))?;
+    let config_file = args
+        .config_file
+        .ok_or_else(|| anyhow!("--config-file is required"))?;
     let opt: Options = json5::from_str(&fs::read_to_string(&config_file)?)?;
 
     let wap_processor = Arc::new(wap::Processor::new(AUDIO_SAMPLE_RATE)?);
@@ -210,17 +222,23 @@ fn main() -> Result<(), Error> {
     wap_processor.set_config(opt.config);
     let frame_size = wap_processor.num_samples_per_frame();
 
-    let mut capture_source =
-        if let Some(path) = &opt.capture.source_path { Some(open_wav_reader(path)?) } else { None };
-    let mut render_source =
-        if let Some(path) = &opt.render.source_path { Some(open_wav_reader(path)?) } else { None };
+    let mut capture_source = if let Some(path) = &opt.capture.source_path {
+        Some(open_wav_reader(path)?)
+    } else {
+        None
+    };
+    let mut render_source = if let Some(path) = &opt.render.source_path {
+        Some(open_wav_reader(path)?)
+    } else {
+        None
+    };
 
-    let buffer_pool = Arc::new(ArrayQueue::<Arc<Vec::<f32>>>::new(64));
+    let buffer_pool = Arc::new(ArrayQueue::<Arc<Vec<f32>>>::new(64));
     for _ in 0..64 {
-        buffer_pool.push(Arc::new(
-            vec![0f32; frame_size * opt.capture.num_channels as usize]
-        )
-        );
+        buffer_pool.push(Arc::new(vec![
+            0f32;
+            frame_size * opt.capture.num_channels as usize
+        ]));
     }
     let (worker_in_tx, worker_in_rx) = channel();
     let buffer_pool_wrkr = buffer_pool.clone();
@@ -255,7 +273,8 @@ fn main() -> Result<(), Error> {
 
     let shared_worker = shared.clone();
     let worker_thr = thread::spawn(move || {
-        worker_thread(worker_in_rx,
+        worker_thread(
+            worker_in_rx,
             &preprocess_sink_path,
             &postprocess_sink_path,
             buffer_pool_wrkr,
@@ -263,7 +282,9 @@ fn main() -> Result<(), Error> {
             frame_size,
             barrier_worker,
             args.model,
-            roc_opts, shared_worker);
+            roc_opts,
+            shared_worker,
+        );
     });
 
     let audio_callback = {
@@ -275,12 +296,16 @@ fn main() -> Result<(), Error> {
             vec![vec![0f32; frame_size]; opt.render.num_channels as usize];
 
         // Dedicated render buffer — not taken from the shared pool since it never leaves the callback.
-        let mut render_buffer =
-            vec![0f32; frame_size * opt.render.num_channels as usize];
+        let mut render_buffer = vec![0f32; frame_size * opt.render.num_channels as usize];
 
         let mute = opt.render.mute;
         let wap_processor = Arc::clone(&wap_processor);
-        move |portaudio::DuplexStreamCallbackArgs { in_buffer, out_buffer, frames, .. }| {
+        move |portaudio::DuplexStreamCallbackArgs {
+                  in_buffer,
+                  out_buffer,
+                  frames,
+                  ..
+              }| {
             assert_eq!(frames, frame_size);
 
             let mut should_continue = true;
@@ -299,9 +324,11 @@ fn main() -> Result<(), Error> {
             }
 
             deinterleave(in_buf, &mut input_deinterleaved);
-            wap_processor.process_capture_frame(&mut input_deinterleaved).unwrap();
+            wap_processor
+                .process_capture_frame(&mut input_deinterleaved)
+                .unwrap();
             interleave(&input_deinterleaved, in_buf);
-            
+
             worker_in_tx.send(in_buffer_arc).unwrap();
 
             render_buffer.iter_mut().for_each(|s| *s = 0.0);
@@ -313,7 +340,9 @@ fn main() -> Result<(), Error> {
             }
 
             deinterleave(&render_buffer, &mut output_deinterleaved);
-            wap_processor.process_render_frame(&mut output_deinterleaved).unwrap();
+            wap_processor
+                .process_render_frame(&mut output_deinterleaved)
+                .unwrap();
             interleave(&output_deinterleaved, out_buffer);
 
             if mute {
@@ -377,15 +406,13 @@ fn worker_thread(
     buffer_pool: Arc<ArrayQueue<Arc<Vec<f32>>>>,
     num_channels: u16,
     frame_size: usize,
-    barrier: Arc::<Barrier>,
+    barrier: Arc<Barrier>,
     model: Option<PathBuf>,
     roc_opts: Option<RocSendOptions>,
     shared: Arc<Shared>,
 ) {
     let num_ch = num_channels as usize;
-    let mut proc = ap::new(num_ch, frame_size, 
-        model,
-        80f32);
+    let mut proc = ap::new(num_ch, frame_size, model, 80f32);
 
     let mut roc_sender = if roc_opts.is_some() {
         let roc_sender = RocTimedSender::new(roc_opts.unwrap(), shared.clone());
@@ -395,7 +422,9 @@ fn worker_thread(
             return;
         }
         Some(roc_sender.unwrap())
-    } else { None };
+    } else {
+        None
+    };
 
     // Dedicated output buffer for processing — not taken from the shared pool.
     let mut out_buffer = Arc::new(vec![0.0f32; frame_size * num_ch]);
@@ -410,11 +439,25 @@ fn worker_thread(
     } else {
         None
     };
-    
+
     barrier.wait();
 
     // Frames per periodic debug log (~1s at 10 ms/frame).
     const LOG_EVERY_FRAMES: u64 = 100;
+
+    // Real-time budget for one frame: frame_size samples at the capture rate.
+    // process_frame must finish within this wall-clock time to keep up with the
+    // live audio stream; if it doesn't, the drain loop below discards frames and
+    // the roc receiver starves.
+    let frame_dur_secs = frame_size as f32 / AUDIO_SAMPLE_RATE as f32;
+
+    // Rolling 5 s statistics for the DeepFilterNet real-time factor.
+    const RTF_REPORT_INTERVAL: time::Duration = time::Duration::from_secs(5);
+    let mut rtf_window_start = time::Instant::now();
+    let mut rtf_sum = 0.0f32;
+    let mut rtf_max = 0.0f32;
+    let mut rtf_count: u64 = 0;
+    let mut dropped_frames: u64 = 0;
 
     loop {
         match in_buffers.recv() {
@@ -424,11 +467,42 @@ fn worker_thread(
                 while let Ok(newer) = in_buffers.try_recv() {
                     let _ = buffer_pool.push(buf_in);
                     buf_in = newer;
+                    dropped_frames += 1;
                 }
 
                 proc.enable_denoise(shared.deepfilternet_enabled());
+                let denoise_on = shared.deepfilternet_enabled();
+                let t0 = time::Instant::now();
                 let snr = proc.process_frame(buf_in.clone(), &mut out_buffer);
+                let elapsed = t0.elapsed();
                 shared.set_current_snr(snr);
+
+                // Only accumulate the real-time factor while DeepFilterNet is
+                // actually running; the disabled path is a trivial copy and would
+                // otherwise dilute the statistics.
+                if denoise_on {
+                    let rtf = elapsed.as_secs_f32() / frame_dur_secs;
+                    rtf_sum += rtf;
+                    rtf_max = rtf_max.max(rtf);
+                    rtf_count += 1;
+                }
+
+                if rtf_window_start.elapsed() >= RTF_REPORT_INTERVAL {
+                    if rtf_count > 0 {
+                        let avg = rtf_sum / rtf_count as f32;
+                        shared.push_log(
+                            roc::log::Level::Info,
+                            format!(
+                                "DFN RTF avg={avg:.2}x max={rtf_max:.2}x (n={rtf_count}, dropped={dropped_frames}) / 5s"
+                            ),
+                        );
+                    }
+                    rtf_window_start = time::Instant::now();
+                    rtf_sum = 0.0;
+                    rtf_max = 0.0;
+                    rtf_count = 0;
+                    dropped_frames = 0;
+                }
 
                 // Publish the input level (dBFS) for the level meter.
                 let level_dbfs = proc.level_dbfs();
@@ -465,7 +539,7 @@ fn worker_thread(
             Err(_) => {
                 shared.push_log(roc::log::Level::Error, "Error while getting a buffer");
                 RUNNING.store(false, Ordering::SeqCst);
-                return
+                return;
             }
         }
     }
@@ -502,11 +576,14 @@ impl RocTimedSender {
         if !above && self.sender.is_none() {
             return Ok(self.sender.is_some());
         } else if above && self.sender.is_none() {
-            let roc_sender = self.make_sender(
-                self.config.destination.clone(),
-                self.config.source,
-                self.config.repair,
-               self.config.control).expect("failed to create roc sender");
+            let roc_sender = self
+                .make_sender(
+                    self.config.destination.clone(),
+                    self.config.source,
+                    self.config.repair,
+                    self.config.control,
+                )
+                .expect("failed to create roc sender");
             self.sender = Some(roc_sender);
             self.shared
                 .push_log(roc::log::Level::Info, format!("Start sending, SNR {snr}"));
@@ -524,9 +601,13 @@ impl RocTimedSender {
         Ok(self.sender.is_some())
     }
 
-    fn make_sender(&mut self, roc_send_ip: String, source_port: u16, repair_port: Option<u16>, control_port: Option<u16>)
-        -> Result<roc::sender::Sender, Error>{
-
+    fn make_sender(
+        &mut self,
+        roc_send_ip: String,
+        source_port: u16,
+        repair_port: Option<u16>,
+        control_port: Option<u16>,
+    ) -> Result<roc::sender::Sender, Error> {
         let sender_config = roc::config::SenderConfig::builder()
             .frame_encoding(roc::config::MediaEncodingFactory::mono(
                 AUDIO_SAMPLE_RATE,
@@ -551,7 +632,7 @@ impl RocTimedSender {
             .result()?;
 
         source_endp.deallocate();
-    
+
         if let Some(control_port) = control_port {
             let control_endp = roc::endpoint::EndpointBuilder::new()
                 .host(roc_send_ip.clone())
